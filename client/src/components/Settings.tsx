@@ -2,8 +2,8 @@ import React, { useState, useEffect } from 'react';
 
 export const Settings: React.FC = () => {
     const [emailConfig, setEmailConfig] = useState({
-        emailAddress: '',
-        subject: ''
+        emailAddress: 'partiksingh28@gmail.com',
+        subject: 'LUCID IMAP TEST'
     });
     const [loading, setLoading] = useState(false);
 
@@ -101,7 +101,7 @@ export const Settings: React.FC = () => {
                             <span className="text-blue-600">🔄</span>
                             <span className="text-sm font-medium text-gray-900">Email Sync</span>
                         </div>
-                        <span className="text-sm text-blue-600">Every 30 seconds</span>
+                        <span className="text-sm text-blue-600">Every 2 Minutes</span>
                     </div>
                 </div>
             </div>
