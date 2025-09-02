@@ -11,50 +11,136 @@ dotenv.config();
 @Injectable()
 export class EmailService {
   private readonly logger = new Logger(EmailService.name);
-  private imap: Imap;
+  private imap: Imap | null = null;
+  private isConnecting = false;
+  private connectionPromise: Promise<void> | null = null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 5;
+  private reconnectDelay = 30000; // 30 seconds
 
   constructor(
     @InjectModel(Email.name) private emailModel: Model<EmailDocument>,
-  ) {
-    this.initializeImap();
+  ) { }
+  // Clean up connections when module is destroyed
+  onModuleDestroy() {
+    this.cleanup();
+  }
+  private cleanup(): void {
+    if (this.imap) {
+      this.imap.removeAllListeners();
+      if (this.imap.state !== 'disconnected') {
+        this.imap.end();
+      }
+      this.imap = null;
+    }
+    this.connectionPromise = null;
+    this.isConnecting = false;
   }
 
-  private initializeImap(): void {
-    this.imap = new Imap({
+  private createImap(): Imap {
+    const imap = new Imap({
       user: process.env.IMAP_USER!,
       password: process.env.IMAP_PASSWORD!,
       host: 'imap.gmail.com',
       port: 993,
       tls: true,
-      tlsOptions: { rejectUnauthorized: false },
+      tlsOptions: {
+        rejectUnauthorized: false,
+        servername: 'imap.gmail.com'
+      },
+      keepalive: {
+        interval: 10000,
+        idleInterval: 300000,
+        forceNoop: true
+      }
     });
 
-    this.imap.once('ready', () => {
+    // Set max listeners to prevent memory leak warning
+    imap.setMaxListeners(15);
+
+    return imap;
+  }
+
+  private setupImapEventListeners(imap: Imap): void {
+    imap.once('ready', () => {
       this.logger.log('IMAP connection ready');
+      this.reconnectAttempts = 0; // Reset on successful connection
     });
 
-    this.imap.once('error', (err: any) => {
-      this.logger.error('IMAP connection error:', err);
+    imap.once('error', (err: any) => {
+      this.logger.error('IMAP connection error:', err.message);
+      this.handleConnectionError(err);
     });
 
-    this.imap.once('end', () => {
+    imap.once('end', () => {
       this.logger.log('IMAP connection ended');
+      this.cleanup();
     });
+
+    imap.on('close', (hadError: boolean) => {
+      this.logger.log(`IMAP connection closed${hadError ? ' with error' : ''}`);
+      this.cleanup();
+    });
+  }
+  private handleConnectionError(error: any): void {
+    this.cleanup();
+
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      this.logger.log(`Scheduling reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${this.reconnectDelay / 1000}s`);
+
+      setTimeout(() => {
+        this.connectionPromise = null;
+      }, this.reconnectDelay);
+    } else {
+      this.logger.error('Max reconnection attempts reached. Will retry on next cron job.');
+      this.reconnectAttempts = 0; // Reset for next cron cycle
+    }
   }
 
   // Ensure connection before checking for new emails
   private ensureImapConnection(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (this.imap.state === 'ready') {
-        return resolve();
+    // If already connecting, wait for that connection
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    // If already connected and ready, return immediately
+    if (this.imap && this.imap.state === 'authenticated') {
+      return Promise.resolve();
+    }
+    // Create new connection
+    this.connectionPromise = new Promise((resolve, reject) => {
+      try {
+        this.cleanup(); // Clean up any existing connection
+
+        this.imap = this.createImap();
+        this.setupImapEventListeners(this.imap);
+
+        const timeout = setTimeout(() => {
+          reject(new Error('IMAP connection timeout'));
+        }, 30000); // 30 second timeout
+
+        this.imap.once('ready', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+
+        this.imap.once('error', (err: any) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
+
+        this.imap.connect();
+      } catch (error) {
+        reject(error);
       }
-      this.imap.once('ready', resolve);
-      this.imap.once('error', reject);
-      this.imap.connect();
     });
+
+    return this.connectionPromise;
   }
 
-  // Check for new emails every 30 seconds
+  // Check for new emails every 2 minutes
   @Cron('*/30 * * * * *')
   async checkForNewEmails(): Promise<void> {
     try {
@@ -66,51 +152,69 @@ export class EmailService {
   }
 
   private async connectAndFetchEmails(): Promise<void> {
-    try {
+    return new Promise((resolve, reject) => {
+      if (!this.imap || this.imap.state !== 'authenticated') {
+        reject(new Error('IMAP not connected'));
+        return;
+      }
+
       this.imap.openBox('INBOX', false, (err, box) => {
         if (err) {
           this.logger.error('Error opening inbox:', err);
+          reject(err);
           return;
         }
 
         // Search for unread emails with a specific subject
-        this.imap.search(
-          ['UNSEEN', ['SUBJECT', 'Buy MORE, Save MORE 🔥']],
-          async (err, results) => {
+        this.imap?.search(
+          ['UNSEEN', ['SUBJECT', 'EMAIL_ANALYSIS_TEST']],
+          (err, results) => {
             if (err) {
               this.logger.error('Error searching emails:', err);
+              reject(err);
               return;
             }
 
             if (results.length === 0) {
               this.logger.log('No new test emails found.');
+              resolve();
               return;
             }
 
             this.logger.log(`Found ${results.length} new test emails`);
 
-            const fetch = this.imap.fetch(results, {
+            const fetch = this.imap?.fetch(results, {
               bodies: '',
               markSeen: true,
             });
 
-            fetch.on('message', (msg, seqno) => {
-              this.processMessage(msg, seqno);
+            let processedCount = 0;
+            const totalCount = results.length;
+
+            fetch?.on('message', (msg, seqno) => {
+              this.processMessage(msg, seqno).finally(() => {
+                processedCount++;
+                if (processedCount === totalCount) {
+                  resolve();
+                }
+              });
             });
 
-            fetch.once('error', (err) => {
+            fetch?.once('error', (err) => {
               this.logger.error('Error fetching messages:', err);
+              reject(err);
             });
 
-            fetch.once('end', () => {
+            fetch?.once('end', () => {
               this.logger.log('Finished fetching emails.');
+              if (processedCount === totalCount) {
+                resolve();
+              }
             });
           },
         );
       });
-    } catch (error) {
-      this.logger.error('Error fetching emails:', error);
-    }
+    });
   }
 
   private async processMessage(msg: any, seqno: number): Promise<void> {
