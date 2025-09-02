@@ -9,7 +9,7 @@ export const Settings: React.FC = () => {
 
     const fetchEmailConfig = async () => {
         try {
-            const response = await fetch('http://localhost:3000/emails/config/email-address');
+            const response = await fetch(`${import.meta.env.VITE_BASE_URL}/emails/config/email-address`);
             const data = await response.json();
             setEmailConfig(data);
         } catch (error) {

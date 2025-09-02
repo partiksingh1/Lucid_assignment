@@ -19,7 +19,7 @@ function App() {
   const fetchEmails = async () => {
     setLoading(true);
     try {
-      const response = await fetch('http://localhost:3000/emails');
+      const response = await fetch(`${import.meta.env.VITE_BASE_URL}/emails`);
       const data = await response.json();
       setEmails(data);
     } catch (error) {
